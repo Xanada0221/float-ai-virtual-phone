@@ -1,0 +1,8 @@
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "top.float_lantern.twa",
+        "sha256_cert_fingerprints": ["A3:CC:77:96:4D:C0:81:FF:42:03:D3:3D:44:3A:60:29:7B:41:1F:B9:38:9B:67:B9:AC:AE:C9:E7:11:16:93:E0"]
+      }
+    }]
