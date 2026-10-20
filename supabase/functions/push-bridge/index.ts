@@ -127,6 +127,10 @@ async function sendWebPushRaw(
 // ── 主流程 ──
 
 
+/** 识图关着时代替截图进上下文的说明：不留这句话，模型面对的是空白，
+ *  既不知道图回没回来，也不知道自己为什么看不见。 */
+const SHORTCUT_VISION_OFF_NOTE = "（系统记录：未配置或未启用图像识别，本轮回传的图片没有交给你；请结合上一条的文字内容回应。）";
+
 const BRIDGE_EVENT_SENTINEL = "BRIDGE_EVENT_TEXT";
 
 function stripHallucinatedTimestamps(text: string): string {
@@ -314,7 +318,6 @@ type BridgeConfigRow = {
   rules: ServerBridgeRule[];
   cloud_config: EncryptedPayload | null;
   rule_runs: Record<string, string>;
-  daily_cap: number;
   daily_count: { day?: string; count?: number };
   shortcut_actions?: unknown;
 };
@@ -332,6 +335,8 @@ type RuleSnapshot = {
     replyMarker: string;
     resultMarker: string;
     imageMarker?: string;
+    /** 角色 API 的图像识别开关（客户端挂快照时写入）；缺省视为开，兼容老快照 */
+    visionEnabled?: boolean;
   };
   reply?: Record<string, unknown>;
 };
@@ -420,7 +425,7 @@ Deno.serve(async (req: Request) => {
   const runJob = async (): Promise<void> => {
   try {
     const configResponse = await rest(
-      `push_bridge_config?user_id=eq.${encodeURIComponent(job.user_id)}&select=rules,cloud_config,rule_runs,daily_cap,daily_count,shortcut_actions&limit=1`,
+      `push_bridge_config?user_id=eq.${encodeURIComponent(job.user_id)}&select=rules,cloud_config,rule_runs,daily_count,shortcut_actions&limit=1`,
     );
     const configRows = configResponse.ok ? await configResponse.json() as BridgeConfigRow[] : [];
     const config = configRows[0];
@@ -687,8 +692,9 @@ Deno.serve(async (req: Request) => {
     const rules = Array.isArray(config.rules) ? config.rules : [];
     const ruleRuns: Record<string, string> = { ...(config.rule_runs || {}) };
     const today = new Date().toISOString().slice(0, 10);
+    // 每日回话不设上限（曾默认 20 次/天、无 UI 可调、超限静默不回话，已按需求取消）。
+    // daily_count 照常记账，仅作统计与排查。
     let dailyCount = config.daily_count?.day === today ? Number(config.daily_count.count) || 0 : 0;
-    const dailyCap = Math.max(1, Number(config.daily_cap) || 20);
 
     const outboxRows: Record<string, unknown>[] = [];
     let generated = 0;
@@ -769,23 +775,18 @@ Deno.serve(async (req: Request) => {
         }
 
         let replyRaw = "";
-        let capped = false;
         if (rule.chat?.requestReply) {
-          if (dailyCount >= dailyCap) {
-            capped = true;
-          } else {
-            const snapshot = await loadSnapshot(rule.id);
-            if (snapshot?.replyRequest && subs.length > 0) {
-              try {
-                const bodyJson = substituteSentinel(JSON.stringify(snapshot.replyRequest.body), BRIDGE_EVENT_SENTINEL, processed);
-                replyRaw = await callLlm(snapshot.replyRequest, bodyJson, 300_000);
-                if (replyRaw) {
-                  dailyCount += 1;
-                  generated += 1;
-                }
-              } catch {
-                replyRaw = "";
+          const snapshot = await loadSnapshot(rule.id);
+          if (snapshot?.replyRequest && subs.length > 0) {
+            try {
+              const bodyJson = substituteSentinel(JSON.stringify(snapshot.replyRequest.body), BRIDGE_EVENT_SENTINEL, processed);
+              replyRaw = await callLlm(snapshot.replyRequest, bodyJson, 300_000);
+              if (replyRaw) {
+                dailyCount += 1;
+                generated += 1;
               }
+            } catch {
+              replyRaw = "";
             }
           }
         }
@@ -866,8 +867,15 @@ Deno.serve(async (req: Request) => {
                   contBodyJson = substituteSentinel(contBodyJson, BRIDGE_EVENT_SENTINEL, processed);
                   contBodyJson = substituteSentinel(contBodyJson, continuation.replyMarker, replyRaw);
                   const isImage = resultMode === "image";
-                  if (!isImage && continuation.imageMarker) {
-                    contBodyJson = substituteSentinel(contBodyJson, continuation.imageMarker, "（该动作没有图片回传）");
+                  // 识图关着就不送图：送了轻则被模型忽略，重则接口直接 400 让整个
+                  // 第二轮失败。图片位改放一句说明，附带文字仍经 resultMarker 抵达。
+                  const canSendImage = isImage && continuation.visionEnabled !== false;
+                  if (!canSendImage && continuation.imageMarker) {
+                    contBodyJson = substituteSentinel(
+                      contBodyJson,
+                      continuation.imageMarker,
+                      isImage ? SHORTCUT_VISION_OFF_NOTE : "（该动作没有图片回传）",
+                    );
                   }
                   const expiresIn = Math.max(30, Math.min(900, Number(catalogAction.expiresInSeconds) || 120));
                   const contPayload = {
@@ -877,7 +885,7 @@ Deno.serve(async (req: Request) => {
                       actionName: String(catalogAction.name ?? "快捷动作"),
                       resultMode,
                       resultMarker: continuation.resultMarker,
-                      ...(isImage && continuation.imageMarker ? { imageMarker: continuation.imageMarker } : {}),
+                      ...(canSendImage && continuation.imageMarker ? { imageMarker: continuation.imageMarker } : {}),
                       style: "text",
                     },
                     notify: { title: rule.chat?.characterName || "小手机", url: "/" },
@@ -979,7 +987,6 @@ Deno.serve(async (req: Request) => {
           deferredActions: rule.deferredActions ?? [],
           ...(shortcutNote ? { shortcutNote } : {}),
           ...(executedShortcutMarker ? { shortcutMarker: executedShortcutMarker } : {}),
-          capped,
           reply: replyRaw ? (await loadSnapshot(rule.id))?.reply ?? null : null,
         };
         const stored = await rest("push_outbox", {
